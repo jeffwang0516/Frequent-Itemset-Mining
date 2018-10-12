@@ -25,5 +25,10 @@ $3: output file
   $ bash eclat.sh $1 $2 $3
   ```
 
+## Performance Comparison
+![img](time_compare.png)
+
+
 ## Issues
 - minimum support below 0.2 still has bad performance
+
