@@ -24,3 +24,6 @@ $3: output file
   ```sh
   $ bash eclat.sh $1 $2 $3
   ```
+
+## Issues
+- minimum support below 0.2 still has bad performance
