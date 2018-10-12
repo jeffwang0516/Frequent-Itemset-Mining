@@ -13,6 +13,7 @@ class FrequentItemsetAlgorithm():
 
     def save_output(self, filename):
         print("Saving output to file:", filename)
+        # supportList = sorted(self.support_dict.items(), key=lambda t: len(t[0]))
         with open(filename, 'w') as fp:
             for k, v in self.support_dict.items():
                 items = ' '.join([str(item) for item in sorted(k)])
