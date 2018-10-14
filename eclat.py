@@ -12,7 +12,7 @@ if __name__ == '__main__':
     min_support_ratio = float(sys.argv[2])
     output_file = sys.argv[3]
 
-    eclat = Eclat()
+    eclat = Eclat(use_data_struc='np_bit_array')
 
     # Preprocess data
     eclat.proccess_input_data(input_file)
