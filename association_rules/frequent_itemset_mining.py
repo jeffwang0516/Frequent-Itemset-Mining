@@ -48,6 +48,7 @@ class Apriori(FrequentItemsetAlgorithm):
         super().__init__()
 
     def proccess_input_data(self, filename):
+        print('Processing data input...')
         with open(filename, 'r') as fp:
             for line in fp:
                 tx = [int(item) for item in line.split()]
@@ -131,6 +132,13 @@ class Apriori(FrequentItemsetAlgorithm):
 
 
 class Eclat(FrequentItemsetAlgorithm):
+    DATA_STRUCT_AVAILABLE = {
+            'TIDSET': 1,
+            'naive_bit': 2,
+            'compressed_bit': 3,
+            'np_bit_array': 4
+    }
+
     def __init__(self, use_data_struc='np_bit_array'):
         """
         Arg:
@@ -141,23 +149,17 @@ class Eclat(FrequentItemsetAlgorithm):
         self.bitvector_data = dict()
         self.bitvector_data_compressed = dict()
         self.bitvector_data_with_numpy = dict()
-        self.data_struc_available = {
-            'TIDSET': 1,
-            'naive_bit': 2,
-            'compressed_bit': 3,
-            'np_bit_array': 4
-        }
-        if use_data_struc not in self.data_struc_available.keys():
+        
+        if use_data_struc not in self.DATA_STRUCT_AVAILABLE.keys():
             raise ValueError(
                 "Data struc not available! Only ['TIDSET', 'naive_bit', 'compressed_bit', 'np_bit_array']  ")
-        self.data_struc = self.data_struc_available[use_data_struc]
+        self.data_struc = self.DATA_STRUCT_AVAILABLE[use_data_struc]
 
-        if self.data_struc == self.data_struc_available['compressed_bit']:
+        if self.data_struc == self.DATA_STRUCT_AVAILABLE['compressed_bit']:
             raise ValueError('Compressed bit still buggy! Please use other data struc!')
 
     def proccess_input_data(self, filename):
-        print('Processing data input!')
-        
+        print('Processing data input...')
         with open(filename, 'r') as fp:
             for line in fp:
                 tx = [int(item) for item in line.split()]
@@ -172,56 +174,55 @@ class Eclat(FrequentItemsetAlgorithm):
                     self.bitvector_data[item] = list()  # ""
                 if item not in self.bitvector_data_compressed:
                     self.bitvector_data_compressed[item] = list()
-                if item not in self.bitvector_data_with_numpy:
-                    self.bitvector_data_with_numpy[item] = np.array(
-                        [], dtype=np.int)
-
-            # Create tidset & bit vector
+                
+            # Create tidset & naive bit vector
             for idx, tx in enumerate(self.TXs_sets):
                 for item in self.tidset_data.keys():
                     if item.issubset(tx):
                         self.tidset_data[item].update({idx+1})
-                        self.bitvector_data[item].append(1)  # += '1'
-                        self.bitvector_data_with_numpy[item] = np.append(
-                            self.bitvector_data_with_numpy[item], 1)
+                        self.bitvector_data[item].append(1)
                     else:
-                        self.bitvector_data[item].append(0)  # += '0'
-                        self.bitvector_data_with_numpy[item] = np.append(
-                            self.bitvector_data_with_numpy[item], 0)
+                        self.bitvector_data[item].append(0)
 
-            # Compressed bit vector data
-            for item in self.item_sets:
-                raw_str = ''.join([str(bit)
-                                   for bit in self.bitvector_data[item]])
-                first_bit = int(raw_str[0])
-                inv_bit = str(first_bit ^ 1)
+            if self.data_struc == self.DATA_STRUCT_AVAILABLE['np_bit_array']:
+                # Create numpy bit array
+                for item in self.bitvector_data.keys():
+                    self.bitvector_data_with_numpy[item] = np.array(self.bitvector_data[item], dtype=np.int)
+            
+            elif self.data_struc == self.DATA_STRUCT_AVAILABLE['compressed_bit']:
+                # Compressed bit vector data
+                for item in self.item_sets:
+                    raw_str = ''.join([str(bit)
+                                    for bit in self.bitvector_data[item]])
+                    first_bit = int(raw_str[0])
+                    inv_bit = str(first_bit ^ 1)
 
-                try:
-                    left_trailing_idx = raw_str.index(inv_bit)
-                    right_trailing_idx = raw_str.rindex(inv_bit)+1
+                    try:
+                        left_trailing_idx = raw_str.index(inv_bit)
+                        right_trailing_idx = raw_str.rindex(inv_bit)+1
 
-                    remain_frag = raw_str[left_trailing_idx:right_trailing_idx]
+                        remain_frag = raw_str[left_trailing_idx:right_trailing_idx]
 
-                    if first_bit == 1:
-                        remain_frag = remain_frag.replace(
-                            '0', 'x').replace('1', '0').replace('x', '1')
+                        if first_bit == 1:
+                            remain_frag = remain_frag.replace(
+                                '0', 'x').replace('1', '0').replace('x', '1')
 
-                    self.bitvector_data_compressed[item] += [
-                        first_bit, left_trailing_idx, remain_frag]
-                except ValueError:
-                    self.bitvector_data_compressed[item] += [
-                        first_bit, len(raw_str), ""]
+                        self.bitvector_data_compressed[item] += [
+                            first_bit, left_trailing_idx, remain_frag]
+                    except ValueError:
+                        self.bitvector_data_compressed[item] += [
+                            first_bit, len(raw_str), ""]
 
             self.TXs_amount = len(self.TXs_sets)
 
     def calculate_one_item_support(self):
         self.support_dict = dict()
 
-        if self.data_struc == self.data_struc_available['TIDSET']:
+        if self.data_struc == self.DATA_STRUCT_AVAILABLE['TIDSET']:
             # Operation with Tidset data
             for key, tidset in self.tidset_data.items():
                 self.support_dict[key] = len(tidset)
-        elif self.data_struc == self.data_struc_available['np_bit_array']:
+        elif self.data_struc == self.DATA_STRUCT_AVAILABLE['np_bit_array']:
             # Operation with numpy bit array
             for key, bit_array in self.bitvector_data_with_numpy.items():
                 self.support_dict[key] = np.sum(bit_array)
@@ -409,14 +410,14 @@ class Eclat(FrequentItemsetAlgorithm):
         return [flag_res, rem_res, data_res]
 
     def refresh_support(self, dict_to_check=None):
-        if self.data_struc == self.data_struc_available['TIDSET']:
+        if self.data_struc == self.DATA_STRUCT_AVAILABLE['TIDSET']:
             # Operation with Tidset data
             for key in dict_to_check.keys():
                 tidsets = [self.tidset_data[frozenset([item])] for item in key]
                 intersect = set.intersection(*tidsets)
                 dict_to_check[key] = len(intersect)
 
-        elif self.data_struc == self.data_struc_available['naive_bit']:
+        elif self.data_struc == self.DATA_STRUCT_AVAILABLE['naive_bit']:
 
             # Operation with naive bit vector data
             for key in dict_to_check.keys():
@@ -437,7 +438,7 @@ class Eclat(FrequentItemsetAlgorithm):
 
                 dict_to_check[key] = sum(res)
 
-        elif self.data_struc == self.data_struc_available['compressed_bit']:
+        elif self.data_struc == self.DATA_STRUCT_AVAILABLE['compressed_bit']:
             # Operation with compressed bit vector data
             for key in dict_to_check.keys():
                 bitvec_sets = [
@@ -460,7 +461,7 @@ class Eclat(FrequentItemsetAlgorithm):
                 else:
                     dict_to_check[key] = self.TXs_amount - num_of_1s
 
-        elif self.data_struc == self.data_struc_available['np_bit_array']:
+        elif self.data_struc == self.DATA_STRUCT_AVAILABLE['np_bit_array']:
             # Operation with numpy bit array
             for key in dict_to_check.keys():
                 bitvec_sets = [
