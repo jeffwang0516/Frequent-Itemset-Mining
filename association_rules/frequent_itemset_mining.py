@@ -200,6 +200,7 @@ class Eclat(FrequentItemsetAlgorithm):
                 if(!op_and_odata[i]) continue;
                 for (int j = 1; j < *ITEM_SIZE; j+=1) {
                     op_and_odata[i] = op_and_odata[i] & bit_array[i + itemset_id[j]*(*DATA_SIZE)];
+                    if(!op_and_odata[i]) break;
                 }
             }
         }
@@ -230,6 +231,7 @@ class Eclat(FrequentItemsetAlgorithm):
             self.op_and_func = self.GPU_MOD.get_function("op_and")
             self.count_support = self.GPU_MOD.get_function("count_support")
             
+            self.bit_2DArray_index = None
             self.bit_2DArray_gpu = None
             self.bit_vec_keys_gpu = None
             self.itemset_size_gpu = None
@@ -297,7 +299,9 @@ class Eclat(FrequentItemsetAlgorithm):
                 bit_2DArray_key_val = sorted(self.bitvector_data_with_numpy.items(), key=lambda x: tuple(x[0]))
                 
                 bit_2DArray = []
-                for item in bit_2DArray_key_val:
+                self.bit_2DArray_index = {}
+                for idx, item in enumerate(bit_2DArray_key_val):
+                    self.bit_2DArray_index[list(item[0])[0]] = idx
                     bit_2DArray.append(item[1])
                 bit_2DArray = np.array(bit_2DArray, dtype=np.uint8)
                 self.bit_2DArray_gpu = cuda.mem_alloc(bit_2DArray.nbytes)
@@ -332,7 +336,7 @@ class Eclat(FrequentItemsetAlgorithm):
                 intersect_sets_key = []
                 for key in dict_to_check.keys():
                     # Find what keys to do intersections on their bitvectors
-                    bit_vec_keys = np.array([int(item)-1 for item in key], dtype=np.int32)
+                    bit_vec_keys = np.array([self.bit_2DArray_index[item] for item in key], dtype=np.int32)
                     cuda.memcpy_htod(self.bit_vec_keys_gpu, bit_vec_keys)
                     
                     bit_vec_keys_size = np.int32(len(bit_vec_keys))
