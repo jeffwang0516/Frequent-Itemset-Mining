@@ -1,3 +1,6 @@
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
 import numpy as np
 
 
@@ -130,90 +133,176 @@ class Apriori(FrequentItemsetAlgorithm):
             # Update into support_dict, records all frequent itemset
             self.support_dict.update(current_level_dict)
 
-
 class Eclat(FrequentItemsetAlgorithm):
     DATA_STRUCT_AVAILABLE = {
             'TIDSET': 1,
-            'naive_bit': 2,
-            'compressed_bit': 3,
+            # 'naive_bit': 2,
+            # 'compressed_bit': 3,
             'np_bit_array': 4
     }
+    
+    GPU_MOD = SourceModule("""
+        __device__ void warpReduce(volatile int* sdata, int tid) {
+            sdata[tid] += sdata[tid + 32];
+            sdata[tid] += sdata[tid + 16];
+            sdata[tid] += sdata[tid + 8];
+            sdata[tid] += sdata[tid + 4];
+            sdata[tid] += sdata[tid + 2];
+            sdata[tid] += sdata[tid + 1];
+        }
+        __global__ void count_support(char *g_idata, int *g_odata, int *DATA_SIZE) {//(char *bit_array, int *itemset_id, int *ITEM_SIZE, int *g_odata, int *DATA_SIZE) {
 
-    def __init__(self, use_data_struc='np_bit_array'):
+            extern __shared__ int sdata[];
+
+            unsigned int tid = threadIdx.x;
+            unsigned int bid = blockIdx.x;
+            
+            
+            sdata[tid] = 0;
+            for (unsigned int i = bid * (blockDim.x) + tid; i< (*DATA_SIZE); i+=gridDim.x*blockDim.x){
+                sdata[tid] += g_idata[i]; 
+                __syncthreads();
+            }
+
+            __syncthreads();
+
+            for (unsigned int s=blockDim.x/2; s>32; s>>=1) {
+                if (tid < s) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+            if (tid < 32) warpReduce(sdata, tid);
+
+            // write result for this block to global mem
+            if (tid == 0) {
+                g_odata[blockIdx.x] = sdata[0];
+            }
+
+        }
+        __global__ void op_and(char *bit_array, char *op_and_odata, int *itemset_id, int *ITEM_SIZE, int *DATA_SIZE)
+        {
+            /*
+                bit_array
+                
+                01000...1100.. [1st]
+                10010...0111.. [2nd]
+                11011...1101.. [3nd]
+                ..
+                ..
+            */
+            
+            int index = blockIdx.x * blockDim.x + threadIdx.x;
+            int stride = blockDim.x * gridDim.x;
+            int offset0 = itemset_id[0]*(*DATA_SIZE);
+            for (int i = index; i < *DATA_SIZE; i += stride){
+                op_and_odata[i] = bit_array[i + offset0];
+                if(!op_and_odata[i]) continue;
+                for (int j = 1; j < *ITEM_SIZE; j+=1) {
+                    op_and_odata[i] = op_and_odata[i] & bit_array[i + itemset_id[j]*(*DATA_SIZE)];
+                }
+            }
+        }
+      """)
+
+    def __init__(self, use_data_struc='np_bit_array', use_gpu=False, block_param_opAND=(512,1,1), grid_param_opAND=(128,1), block_param_sum=(512,1,1), grid_param_sum=(128,1)):
         """
         Arg:
-            use_data_struc = ['TIDSET', 'naive_bit', 'compressed_bit', 'np_bit_array']
+            use_data_struc = ['TIDSET', 'np_bit_array']
         """
         super().__init__()
         self.tidset_data = dict()
-        self.bitvector_data = dict()
-        self.bitvector_data_compressed = dict()
         self.bitvector_data_with_numpy = dict()
-        
+        self.use_gpu = use_gpu
+
+        if use_gpu:
+            # block, grid param for two gpu functions
+            self.block_param_opAND = block_param_opAND
+            self.grid_param_opAND = grid_param_opAND
+            self.block_param_sum = block_param_sum
+            self.grid_param_sum = grid_param_sum
+            
+            self.data_gpu = None
+            self.shared_mem = None
+            self.result = None
+            self.result_gpu = None
+            self.num_of_TXs_gpu = None
+            self.op_and_func = self.GPU_MOD.get_function("op_and")
+            self.count_support = self.GPU_MOD.get_function("count_support")
+            
+            self.bit_2DArray_gpu = None
+            self.bit_vec_keys_gpu = None
+            self.itemset_size_gpu = None
+
         if use_data_struc not in self.DATA_STRUCT_AVAILABLE.keys():
             raise ValueError(
-                "Data struc not available! Only ['TIDSET', 'naive_bit', 'compressed_bit', 'np_bit_array']  ")
+                "Data struc not available! Only ['TIDSET', 'np_bit_array']  ")
         self.data_struc = self.DATA_STRUCT_AVAILABLE[use_data_struc]
-
-        if self.data_struc == self.DATA_STRUCT_AVAILABLE['compressed_bit']:
-            raise ValueError('Compressed bit still buggy! Please use other data struc!')
 
     def proccess_input_data(self, filename):
         print('Processing data input...')
         with open(filename, 'r') as fp:
-            for line in fp:
+            txCnt = 0
+            for idx, line in enumerate(fp):
                 tx = [int(item) for item in line.split()]
                 self.TXs_sets.append(frozenset(tx))
                 for item in tx:
                     self.item_sets.add(frozenset([item]))
-
-            for item in self.item_sets:
-                if item not in self.tidset_data:
-                    self.tidset_data[item] = set()
-                if item not in self.bitvector_data:
-                    self.bitvector_data[item] = list()  # ""
-                if item not in self.bitvector_data_compressed:
-                    self.bitvector_data_compressed[item] = list()
-                
-            # Create tidset & naive bit vector
-            for idx, tx in enumerate(self.TXs_sets):
-                for item in self.tidset_data.keys():
-                    if item.issubset(tx):
-                        self.tidset_data[item].update({idx+1})
-                        self.bitvector_data[item].append(1)
+                    key = frozenset([item])
+                    if key in self.tidset_data.keys():
+                        self.tidset_data[key].update({txCnt})
                     else:
-                        self.bitvector_data[item].append(0)
-
-            if self.data_struc == self.DATA_STRUCT_AVAILABLE['np_bit_array']:
-                # Create numpy bit array
-                for item in self.bitvector_data.keys():
-                    self.bitvector_data_with_numpy[item] = np.array(self.bitvector_data[item], dtype=np.int)
+                        self.tidset_data[key] = set({txCnt})
+                txCnt += 1
             
-            elif self.data_struc == self.DATA_STRUCT_AVAILABLE['compressed_bit']:
-                # Compressed bit vector data
-                for item in self.item_sets:
-                    raw_str = ''.join([str(bit)
-                                    for bit in self.bitvector_data[item]])
-                    first_bit = int(raw_str[0])
-                    inv_bit = str(first_bit ^ 1)
+            # Create numpy bit array
+            print('Creating bit vector from TIDSET...')
+            for item in self.tidset_data.keys():
+                bit_array = np.zeros(txCnt, dtype=np.int8)
+                for tid in self.tidset_data[item]:
+                    bit_array[tid] = np.int8(1)
+                self.bitvector_data_with_numpy[item] = bit_array
+            
+            self.TXs_amount = txCnt
+            
+            # Initialize data for GPU processing
+            # memcpy is timeconsuming, do it first here
+            if self.use_gpu:
+                print('Initializing GPU MEM')
+                
+                # Store output of the first func op_and and use as input to count_support
+                intermediate_data = np.zeros([txCnt], dtype=np.int8)
+                self.intermediate_data_gpu = cuda.mem_alloc(intermediate_data.nbytes)
+                
+                # Final output
+                self.result = np.zeros([self.block_param_sum[0]], dtype=np.int32)
+                self.result_gpu = cuda.mem_alloc(self.result.nbytes)
+                cuda.memcpy_htod(self.result_gpu, self.result)
 
-                    try:
-                        left_trailing_idx = raw_str.index(inv_bit)
-                        right_trailing_idx = raw_str.rindex(inv_bit)+1
+                # Store Bit vector length = TX amount
+                num_of_TXs = np.int32(txCnt)
+                self.num_of_TXs_gpu = cuda.mem_alloc(num_of_TXs.nbytes)
+                cuda.memcpy_htod(self.num_of_TXs_gpu, num_of_TXs)
 
-                        remain_frag = raw_str[left_trailing_idx:right_trailing_idx]
+                # GPU func count_support needs shared mem (4 * thread_size)
+                self.shared_mem = 4* self.block_param_sum[0]
 
-                        if first_bit == 1:
-                            remain_frag = remain_frag.replace(
-                                '0', 'x').replace('1', '0').replace('x', '1')
-
-                        self.bitvector_data_compressed[item] += [
-                            first_bit, left_trailing_idx, remain_frag]
-                    except ValueError:
-                        self.bitvector_data_compressed[item] += [
-                            first_bit, len(raw_str), ""]
-
-            self.TXs_amount = len(self.TXs_sets)
+                # Store the keys of bit vector to do intersection func on GPU
+                bit_vec_keys = np.arange(2603, dtype=np.int32)
+                self.bit_vec_keys_gpu = cuda.mem_alloc(bit_vec_keys.nbytes)
+                bit_vec_keys_size = np.int32(2603)
+                self.bit_vec_keys_size_gpu = cuda.mem_alloc(bit_vec_keys_size.nbytes)
+                
+                # Copy All Bit vector into gpu
+                bit_2DArray_key_val = sorted(eclat.bitvector_data_with_numpy.items(), key=lambda x: tuple(x[0]))
+                
+                bit_2DArray = []
+                for item in bit_2DArray_key_val:
+                    bit_2DArray.append(item[1])
+                bit_2DArray = np.array(bit_2DArray, dtype=np.uint8)
+                self.bit_2DArray_gpu = cuda.mem_alloc(bit_2DArray.nbytes)
+                cuda.memcpy_htod(self.bit_2DArray_gpu, bit_2DArray)
+                print("Whole bit vector copied to GPU Mem! shape:",bit_2DArray.shape, "size:", bit_2DArray.nbytes, "bytes")
 
     def calculate_one_item_support(self):
         self.support_dict = dict()
@@ -226,188 +315,6 @@ class Eclat(FrequentItemsetAlgorithm):
             # Operation with numpy bit array
             for key, bit_array in self.bitvector_data_with_numpy.items():
                 self.support_dict[key] = np.sum(bit_array)
-        else:
-            # Operation with naive & compressed bit vector data
-            for key, bit_vec in self.bitvector_data.items():
-                self.support_dict[key] = sum(bit_vec)
-
-    def matmul(self, A, B):
-        return [x & y for x, y in zip(A, B)]
-
-    def matmul_str(self, A, B):
-        list_A = [int(c) for c in A]
-        list_B = [int(c) for c in B]
-        return ''.join([str(x & y) for x, y in zip(list_A, list_B)])
-
-    def matmul_or_str(self, A, B):
-        list_A = [int(c) for c in A]
-        list_B = [int(c) for c in B]
-        return ''.join([str(x | y) for x, y in zip(list_A, list_B)])
-
-    def matmul_bitwise_complement_str(self, A):
-        list_A = [int(c) for c in A]
-        return ''.join([str(x ^ 1) for x in list_A])
-
-    def compressed_bitvector_intersect(self, A, B):
-        if A[1] > B[1]:
-            A, B = B, A
-        flag_A, rem_A, data_A = A
-        flag_B, rem_B, data_B = B
-
-        flag_res = 0
-        rem_res = 0
-        data_res = ""
-
-        if flag_A == 0 and flag_B == 0:
-            # 2 origin
-            flag_res = 0
-
-            rem_res = rem_B  # Larger one
-
-            start_A = rem_B - rem_A
-            end_A = len(data_A)
-
-            overlap_len = end_A - start_A
-            start_B = 0
-            end_B = start_B + overlap_len
-
-            # Find overlap part
-            overlap_data_A = data_A[start_A:end_A]
-            overlap_data_B = data_B[start_B:end_B]
-            intersect = self.matmul_str(overlap_data_A, overlap_data_B)
-
-            # Process output data
-            left_trailing_idx = intersect.find('1')
-            right_trailing_idx = intersect.rfind('1')+1
-
-            if left_trailing_idx == -1:
-                left_trailing_idx = 0
-                right_trailing_idx = 0
-
-            rem_res += left_trailing_idx
-            data_res = intersect[left_trailing_idx:right_trailing_idx]
-
-        elif flag_A == 1 and flag_B == 1:
-            # 2 complement
-            flag_res = 1
-
-            if rem_A > rem_B:
-                rem_A, data_A, rem_B, data_B = rem_B, data_B, rem_A, data_A
-            # A is the smaller after exchanged
-            rem_res = rem_A
-            start_A = rem_B - rem_A
-            end_A = len(data_A)
-
-            overlap_len = end_A - start_A
-
-            start_B = 0
-            end_B = start_B + overlap_len
-
-            # Find overlap part
-            overlap_data_A = data_A[start_A:end_A]
-            overlap_data_B = data_B[start_B:end_B]
-            intersect = self.matmul_or_str(overlap_data_A, overlap_data_B)
-
-            tail = ''
-            if len(intersect) < overlap_len:
-                tail = overlap_data_A[len(intersect):]
-            elif end_B <= len(data_B):
-                tail = data_B[end_B:]
-
-            data_res = data_A[:start_A] + intersect + tail
-
-            # Check to output original or complement
-            if rem_A == 0 or rem_B == 0 or len(data_A)+len(data_B)+rem_A+rem_B >= self.TXs_amount:
-                flag_res = 0
-                data_comp = self.matmul_bitwise_complement_str(data_res)
-                left_trailing_idx = data_comp.find('1')
-                right_trailing_idx = data_comp.rfind('1')+1
-
-                if left_trailing_idx == -1:
-                    rem_res = self.TXs_amount
-                    data_res = ''
-                else:
-                    rem_res = left_trailing_idx
-                    data_res = data_comp[left_trailing_idx:right_trailing_idx]
-
-        else:
-            # Always output 0
-            flag_res = 0
-
-            if flag_B == 0:
-                # B origin A complement, exchange AB first
-                # print('Exchanged')
-                rem_A, data_A, rem_B, data_B = rem_B, data_B, rem_A, data_A
-
-            # A after exchanged is always original
-            # A origin B complement
-            rem_res = rem_A  # choose one with original
-
-            if rem_A > rem_B:
-                start_B = rem_A - rem_B
-                end_B = len(data_B)
-
-                overlap_len = end_B - start_B
-
-                start_A = 0
-                end_A = start_A + overlap_len
-                # Find overlap part
-                overlap_data_A = data_A[start_A:end_A]
-                overlap_data_B = data_B[start_B:end_B].replace(
-                    '0', 'x').replace('1', '0').replace('x', '1')
-                intersect = self.matmul_str(overlap_data_A, overlap_data_B)
-                # print((overlap_data_A, overlap_data_B), intersect)
-
-                # Process output data
-                left_trailing_idx = intersect.find('1')
-                # right_trailing_idx = intersect.rfind('1')+1
-
-                if left_trailing_idx == -1:
-                    left_trailing_idx = 0
-                    itersect_result = ""
-                    # right_trailing_idx = 0
-                else:
-                    itersect_result = intersect[left_trailing_idx:]
-
-                rem_res += left_trailing_idx
-                data_res = itersect_result + data_A[end_A:]
-            else:
-                start_Ａ = rem_B - rem_A
-                end_A = len(data_A)
-
-                overlap_len = end_A - start_A
-
-                start_B = 0
-                end_B = start_B + overlap_len
-
-                # Find overlap part
-                overlap_data_A = data_A[start_A:end_A]
-                overlap_data_B = data_B[start_B:end_B].replace(
-                    '0', 'x').replace('1', '0').replace('x', '1')
-                intersect = self.matmul_str(overlap_data_A, overlap_data_B)
-                # print((overlap_data_A, overlap_data_B), intersect)
-
-                # Process output data
-                # left_trailing_idx = intersect.find('1')
-                right_trailing_idx = intersect.rfind('1')+1
-
-                if right_trailing_idx == 0:
-                    itersect_result = ""
-                    # right_trailing_idx = 0
-                else:
-                    itersect_result = intersect[:right_trailing_idx]
-
-                # rem_res += left_trailing_idx
-
-                data_res = data_A[:start_A] + itersect_result
-
-            # else:
-            #     # B origin A complement
-
-            #     rem_res = rem_B # choose one with original
-            #     pass
-
-        return [flag_res, rem_res, data_res]
 
     def refresh_support(self, dict_to_check=None):
         if self.data_struc == self.DATA_STRUCT_AVAILABLE['TIDSET']:
@@ -417,61 +324,39 @@ class Eclat(FrequentItemsetAlgorithm):
                 intersect = set.intersection(*tidsets)
                 dict_to_check[key] = len(intersect)
 
-        elif self.data_struc == self.DATA_STRUCT_AVAILABLE['naive_bit']:
-
-            # Operation with naive bit vector data
-            for key in dict_to_check.keys():
-                bitvec_sets = [
-                    self.bitvector_data[frozenset([item])] for item in key]
-
-                res = [1 for i in range(len(bitvec_sets[0]))]
-
-                for i in range(0, len(bitvec_sets), 2):
-                    A = bitvec_sets[i]
-                    if i+1 >= len(bitvec_sets):
-                        result_AB = A
-                    else:
-                        B = bitvec_sets[i+1]
-                        result_AB = self.matmul(A, B)
-
-                    res = self.matmul(res, result_AB)
-
-                dict_to_check[key] = sum(res)
-
-        elif self.data_struc == self.DATA_STRUCT_AVAILABLE['compressed_bit']:
-            # Operation with compressed bit vector data
-            for key in dict_to_check.keys():
-                bitvec_sets = [
-                    self.bitvector_data_compressed[frozenset([item])] for item in key]
-                res = [1, self.TXs_amount, '']
-
-                for i in range(0, len(bitvec_sets), 2):
-                    A = bitvec_sets[i]
-                    if i+1 >= len(bitvec_sets):
-                        result_AB = A
-                    else:
-                        B = bitvec_sets[i+1]
-                        result_AB = self.compressed_bitvector_intersect(A, B)
-
-                    res = self.compressed_bitvector_intersect(res, result_AB)
-
-                num_of_1s = sum([int(c) for c in res[2]])
-                if res[0] == 0:
-                    dict_to_check[key] = num_of_1s
-                else:
-                    dict_to_check[key] = self.TXs_amount - num_of_1s
-
         elif self.data_struc == self.DATA_STRUCT_AVAILABLE['np_bit_array']:
             # Operation with numpy bit array
-            for key in dict_to_check.keys():
-                bitvec_sets = [
-                    self.bitvector_data_with_numpy[frozenset([item])] for item in key]
+            if self.use_gpu is True:
+                # Use gpu to do intersection & count support
+                intersect_sets = []
+                intersect_sets_key = []
+                for key in dict_to_check.keys():
+                    # Find what keys to do intersections on their bitvectors
+                    bit_vec_keys = np.array([int(item)-1 for item in key], dtype=np.int32)
+                    cuda.memcpy_htod(self.bit_vec_keys_gpu, bit_vec_keys)
+                    
+                    bit_vec_keys_size = np.int32(len(bit_vec_keys))
+                    cuda.memcpy_htod(self.bit_vec_keys_size_gpu, bit_vec_keys_size)
+    
+                    # Do Intersection first
+                    self.op_and_func(self.bit_2DArray_gpu, self.intermediate_data_gpu, self.bit_vec_keys_gpu, self.bit_vec_keys_size_gpu, self.num_of_TXs_gpu, block=self.block_param_opAND, grid=self.grid_param_opAND)
+                    
+                    # Then Count support                
+                    self.count_support(self.intermediate_data_gpu, self.result_gpu, self.num_of_TXs_gpu, block=self.block_param_sum, grid=self.grid_param_sum, shared=self.shared_mem)
+                    cuda.memcpy_dtoh(self.result, self.result_gpu)
+                    
+                    dict_to_check[key] = np.sum(self.result)
 
-                res = bitvec_sets[0]
-                for i in range(1, len(bitvec_sets)):
-                    res = res*bitvec_sets[i]
+            else:
+                for key in dict_to_check.keys():
+                    bitvec_sets = [
+                        self.bitvector_data_with_numpy[frozenset([item])] for item in key]
 
-                dict_to_check[key] = np.sum(res)
+                    res = bitvec_sets[0]
+                    for i in range(1, len(bitvec_sets)):
+                        res = res*bitvec_sets[i]
+                    
+                    dict_to_check[key] = np.sum(res)
 
     def find_supersets_k(self, min_support_ratio):
         # Start from Level 1 (One item)
