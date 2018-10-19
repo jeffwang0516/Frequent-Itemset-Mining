@@ -294,7 +294,7 @@ class Eclat(FrequentItemsetAlgorithm):
                 self.bit_vec_keys_size_gpu = cuda.mem_alloc(bit_vec_keys_size.nbytes)
                 
                 # Copy All Bit vector into gpu
-                bit_2DArray_key_val = sorted(eclat.bitvector_data_with_numpy.items(), key=lambda x: tuple(x[0]))
+                bit_2DArray_key_val = sorted(self.bitvector_data_with_numpy.items(), key=lambda x: tuple(x[0]))
                 
                 bit_2DArray = []
                 for item in bit_2DArray_key_val:
