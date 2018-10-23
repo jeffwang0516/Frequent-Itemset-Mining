@@ -21,14 +21,15 @@ $3: output file
   ```
 
 - Eclat
-  ```sh
-  $ bash eclat.sh $1 $2 $3
-  ```
+  - CPU
+    ```sh
+    $ bash eclat_cpu.sh $1 $2 $3
+    ```
+    
+  - GPU
+    ```sh
+    $ bash eclat_gpu.sh $1 $2 $3
+    ```
 
 ## Performance Comparison
 ![img](time_compare.png)
-
-
-## Issues
-- minimum support below 0.2 still has bad performance
-
