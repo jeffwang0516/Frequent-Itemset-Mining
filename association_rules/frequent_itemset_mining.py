@@ -331,8 +331,6 @@ class Eclat(FrequentItemsetAlgorithm):
             # Operation with numpy bit array
             if self.use_gpu is True:
                 # Use gpu to do intersection & count support
-                intersect_sets = []
-                intersect_sets_key = []
                 for key in dict_to_check.keys():
                     # Find what keys to do intersections on their bitvectors
                     bit_vec_keys = np.array([self.bit_2DArray_index[item] for item in key], dtype=np.int32)
