@@ -1,4 +1,7 @@
+[![Total alerts](https://img.shields.io/lgtm/alerts/g/jeffwang0516/Frequent-Itemset-Mining.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/jeffwang0516/Frequent-Itemset-Mining/alerts/)
+
 # Frequent-Itemset-Mining
+
 Implementation of Apriori and Eclat
 
 ## Environment
